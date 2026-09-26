@@ -625,6 +625,13 @@ typedef enum {
   GHOSTTY_GOTO_SPLIT_RIGHT,
 } ghostty_action_goto_split_e;
 
+// apprt.action.EqualizeSplits
+typedef enum {
+  GHOSTTY_EQUALIZE_SPLITS_ALL,
+  GHOSTTY_EQUALIZE_SPLITS_COLUMNS,
+  GHOSTTY_EQUALIZE_SPLITS_ROWS,
+} ghostty_action_equalize_splits_e;
+
 // apprt.action.GotoWindow
 typedef enum {
   GHOSTTY_GOTO_WINDOW_PREVIOUS,
@@ -1017,6 +1024,7 @@ typedef union {
   ghostty_action_move_tab_s move_tab;
   ghostty_action_goto_tab_e goto_tab;
   ghostty_action_goto_split_e goto_split;
+  ghostty_action_equalize_splits_e equalize_splits;
   ghostty_action_goto_window_e goto_window;
   ghostty_action_resize_split_s resize_split;
   ghostty_action_size_limit_s size_limit;

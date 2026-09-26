@@ -146,8 +146,8 @@ pub const Action = union(Key) {
     /// Resize the split in the given direction.
     resize_split: ResizeSplit,
 
-    /// Equalize all the splits in the target window.
-    equalize_splits,
+    /// Equalize the splits in the target window.
+    equalize_splits: EqualizeSplits,
 
     /// Toggle whether a split is zoomed or not. A zoomed split is resized
     /// to take up the entire window.
@@ -528,6 +528,16 @@ pub const GotoSplit = enum(c_int) {
 
     test "ghostty.h GotoSplit" {
         try lib.checkGhosttyHEnum(GotoSplit, "GHOSTTY_GOTO_SPLIT_");
+    }
+};
+
+pub const EqualizeSplits = enum(c_int) {
+    all,
+    columns,
+    rows,
+
+    test "ghostty.h EqualizeSplits" {
+        try lib.checkGhosttyHEnum(EqualizeSplits, "GHOSTTY_EQUALIZE_SPLITS_");
     }
 };
 

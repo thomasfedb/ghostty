@@ -552,11 +552,23 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = i18n.N_("Toggle read-only mode for the current surface."),
         }},
 
-        .equalize_splits => comptime &.{.{
-            .action = .equalize_splits,
-            .title = i18n.N_("Equalize Splits"),
-            .description = i18n.N_("Equalize the size of all splits."),
-        }},
+        .equalize_splits => comptime &.{
+            .{
+                .action = .{ .equalize_splits = .all },
+                .title = i18n.N_("Equalize Splits"),
+                .description = i18n.N_("Equalize the size of all splits."),
+            },
+            .{
+                .action = .{ .equalize_splits = .columns },
+                .title = i18n.N_("Equalize Split Columns"),
+                .description = i18n.N_("Equalize the widths of splits that are side by side."),
+            },
+            .{
+                .action = .{ .equalize_splits = .rows },
+                .title = i18n.N_("Equalize Split Rows"),
+                .description = i18n.N_("Equalize the heights of splits that are stacked."),
+            },
+        },
 
         .reset_window_size => comptime &.{.{
             .action = .reset_window_size,

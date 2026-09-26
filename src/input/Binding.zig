@@ -675,8 +675,27 @@ pub const Action = union(enum) {
     /// like in `resize_split:up,10`.
     resize_split: SplitResizeParameter,
 
-    /// Equalize the size of all splits in the current window.
-    equalize_splits,
+    /// Equalize the size of splits in the current window.
+    ///
+    /// Valid arguments:
+    ///
+    ///   - `all`
+    ///
+    ///     Equalize the size of all splits. This is the default.
+    ///
+    ///   - `columns`
+    ///
+    ///     Equalize the widths of splits that are side by side, leaving
+    ///     the heights of splits that are stacked within them alone.
+    ///
+    ///   - `rows`
+    ///
+    ///     Equalize the heights of splits that are stacked, leaving the
+    ///     widths of splits that are side by side within them alone.
+    ///
+    /// The `columns` and `rows` arguments are only implemented on Linux.
+    /// On macOS they equalize all splits.
+    equalize_splits: SplitEqualizeTarget,
 
     /// Reset the window to the default size. The "default size" is the
     /// size that a new window would be created with. This has no effect
@@ -1098,6 +1117,14 @@ pub const Action = union(enum) {
             try testing.expectError(error.InvalidFormat, SplitFocusDirection.parse(""));
             try testing.expectError(error.InvalidFormat, SplitFocusDirection.parse("green"));
         }
+    };
+
+    pub const SplitEqualizeTarget = enum {
+        all,
+        columns,
+        rows,
+
+        pub const default: SplitEqualizeTarget = .all;
     };
 
     pub const SplitResizeDirection = enum {

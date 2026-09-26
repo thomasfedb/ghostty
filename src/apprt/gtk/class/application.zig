@@ -699,7 +699,7 @@ pub const Application = extern struct {
 
             .desktop_notification => Action.desktopNotification(self, target, value),
 
-            .equalize_splits => return Action.equalizeSplits(target),
+            .equalize_splits => return Action.equalizeSplits(target, value),
 
             .goto_split => return Action.gotoSplit(target, value),
 
@@ -2401,7 +2401,10 @@ const Action = struct {
         gio_app.sendNotification(n.body, notification);
     }
 
-    pub fn equalizeSplits(target: apprt.Target) bool {
+    pub fn equalizeSplits(
+        target: apprt.Target,
+        value: apprt.action.EqualizeSplits,
+    ) bool {
         switch (target) {
             .app => {
                 log.warn("equalize splits to app is unexpected", .{});
@@ -2410,7 +2413,11 @@ const Action = struct {
 
             .surface => |core| {
                 const surface = core.rt_surface.surface;
-                return surface.as(gtk.Widget).activateAction("split-tree.equalize", null) != 0;
+                return surface.as(gtk.Widget).activateAction(
+                    "split-tree.equalize",
+                    "&s",
+                    @tagName(value).ptr,
+                ) != 0;
             },
         }
     }

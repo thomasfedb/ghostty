@@ -282,6 +282,231 @@ pub fn SplitTree(comptime V: type) type {
             };
         }
 
+        // A "run" is a chain of nested splits that all have the same layout,
+        // such as the splits that make up a row of three or more views. The
+        // members of a run are the nodes it divides between them: views, or
+        // splits with the other layout. Runs let a row or column be treated
+        // as a unit even though each split only has two children.
+
+        /// Returns the root of the run containing the given split node.
+        pub fn runRoot(self: *const Self, at: Node.Handle) Node.Handle {
+            const layout = self.nodes[at.idx()].split.layout;
+            var current = at;
+            while (self.parent(current)) |p| {
+                if (self.nodes[p.idx()].split.layout != layout) break;
+                current = p;
+            }
+            return current;
+        }
+
+        /// Returns the sizes of the members of the run with the given root,
+        /// in order, as fractions of the size of the run. The caller owns
+        /// the returned slice.
+        pub fn runSizes(
+            self: *const Self,
+            alloc: Allocator,
+            root: Node.Handle,
+        ) Allocator.Error![]f64 {
+            var sizes: std.ArrayList(f64) = .empty;
+            errdefer sizes.deinit(alloc);
+            try self.appendRunSizes(
+                alloc,
+                &sizes,
+                root,
+                self.nodes[root.idx()].split.layout,
+                1,
+            );
+            return sizes.toOwnedSlice(alloc);
+        }
+
+        fn appendRunSizes(
+            self: *const Self,
+            alloc: Allocator,
+            sizes: *std.ArrayList(f64),
+            at: Node.Handle,
+            layout: Split.Layout,
+            size: f64,
+        ) Allocator.Error!void {
+            switch (self.nodes[at.idx()]) {
+                .split => |s| if (s.layout == layout) {
+                    const ratio: f64 = s.ratio;
+                    try self.appendRunSizes(alloc, sizes, s.left, layout, size * ratio);
+                    try self.appendRunSizes(alloc, sizes, s.right, layout, size * (1 - ratio));
+                    return;
+                },
+                .leaf => {},
+            }
+
+            try sizes.append(alloc, size);
+        }
+
+        /// Set the ratios of the splits in the run with the given root so
+        /// that its members have the given sizes. The sizes are relative
+        /// to each other and don't need to add up to one. This modifies
+        /// the tree in place.
+        pub fn setRunSizesInPlace(
+            self: *const Self,
+            root: Node.Handle,
+            sizes: []const f64,
+        ) void {
+            var i: usize = 0;
+            _ = self.setRunSizes(
+                root,
+                self.nodes[root.idx()].split.layout,
+                sizes,
+                &i,
+            );
+            assert(i == sizes.len);
+        }
+
+        fn setRunSizes(
+            self: *const Self,
+            at: Node.Handle,
+            layout: Split.Layout,
+            sizes: []const f64,
+            i: *usize,
+        ) f64 {
+            switch (self.nodes[at.idx()]) {
+                .split => |s| if (s.layout == layout) {
+                    const left = self.setRunSizes(s.left, layout, sizes, i);
+                    const right = self.setRunSizes(s.right, layout, sizes, i);
+                    const total = left + right;
+                    const ratio: f64 = if (total > 0) left / total else 0.5;
+                    const nodes: []Node = @constCast(self.nodes);
+                    nodes[at.idx()].split.ratio = @floatCast(ratio);
+                    return total;
+                },
+                .leaf => {},
+            }
+
+            const size = sizes[i.*];
+            i.* += 1;
+            return size;
+        }
+
+        /// Returns the number of members of a run within the given node.
+        fn runCount(
+            self: *const Self,
+            at: Node.Handle,
+            layout: Split.Layout,
+        ) usize {
+            return switch (self.nodes[at.idx()]) {
+                .split => |s| if (s.layout == layout)
+                    self.runCount(s.left, layout) + self.runCount(s.right, layout)
+                else
+                    1,
+                .leaf => 1,
+            };
+        }
+
+        /// Returns the index of the first member of the run with the given
+        /// root that is within the given node.
+        fn runOffset(
+            self: *const Self,
+            root: Node.Handle,
+            at: Node.Handle,
+        ) usize {
+            const layout = self.nodes[root.idx()].split.layout;
+            var offset: usize = 0;
+            var current = at;
+            while (current != root) {
+                const p = self.parent(current).?;
+                const s = self.nodes[p.idx()].split;
+                if (s.right == current) offset += self.runCount(s.left, layout);
+                current = p;
+            }
+            return offset;
+        }
+
+        /// Resize a split in place like `resizeInPlace`, but only change the
+        /// sizes of the two members of its row or column on either side of
+        /// its divider. With `resizeInPlace`, moving the divider between the
+        /// first and second views of a row of three would also resize the
+        /// third view, depending on how the splits are nested.
+        ///
+        /// The allocator is only used for temporary state.
+        pub fn resizeDividerInPlace(
+            self: *const Self,
+            alloc: Allocator,
+            at: Node.Handle,
+            ratio: f16,
+        ) Allocator.Error!void {
+            const s = self.nodes[at.idx()].split;
+            const root = self.runRoot(at);
+            const sizes = try self.runSizes(alloc, root);
+            defer alloc.free(sizes);
+
+            // The members within this split, and the divider between its
+            // left and right sides.
+            const first = self.runOffset(root, at);
+            const left_count = self.runCount(s.left, s.layout);
+            const count = left_count + self.runCount(s.right, s.layout);
+            const before = first + left_count - 1;
+            const after = first + left_count;
+
+            var total: f64 = 0;
+            for (sizes[first .. first + count]) |v| total += v;
+            var left: f64 = 0;
+            for (sizes[first .. first + left_count]) |v| left += v;
+
+            // Move the divider, but not past the far edges of the members
+            // on either side of it.
+            const ratio_f64: f64 = ratio;
+            const delta = std.math.clamp(
+                ratio_f64 * total - left,
+                -sizes[before],
+                sizes[after],
+            );
+            sizes[before] += delta;
+            sizes[after] -= delta;
+
+            self.setRunSizesInPlace(root, sizes);
+        }
+
+        /// Remove a view like `remove`, but share the space it used between
+        /// all the other members of its row or column in proportion to their
+        /// sizes, rather than giving it all to its neighbor.
+        pub fn removeDistributed(
+            self: *Self,
+            gpa: Allocator,
+            at: Node.Handle,
+        ) Allocator.Error!Self {
+            assert(self.nodes[at.idx()] == .leaf);
+            const parent_handle = self.parent(at) orelse
+                return self.remove(gpa, at);
+
+            // Shrink the view to nothing, growing the other members of its
+            // run to fill the space, so that removing it doesn't change the
+            // size of anything else.
+            var resized = try self.clone(gpa);
+            defer resized.deinit();
+            const root = resized.runRoot(parent_handle);
+            const sizes = try resized.runSizes(gpa, root);
+            defer gpa.free(sizes);
+            const i = resized.runOffset(root, at);
+            if (sizes[i] < 1) {
+                const scale = 1 / (1 - sizes[i]);
+                for (sizes) |*v| v.* *= scale;
+            }
+            sizes[i] = 0;
+            resized.setRunSizesInPlace(root, sizes);
+
+            return resized.remove(gpa, at);
+        }
+
+        /// Returns the split node that directly contains the given node,
+        /// or null if it is the root.
+        fn parent(self: *const Self, child: Node.Handle) ?Node.Handle {
+            for (self.nodes, 0..) |node, i| switch (node) {
+                .leaf => {},
+                .split => |s| if (s.left == child or s.right == child) {
+                    return @enumFromInt(i);
+                },
+            };
+
+            return null;
+        }
+
         pub const Side = enum { left, right };
 
         /// Returns the deepest view in the tree in the given direction.
@@ -771,6 +996,7 @@ pub fn SplitTree(comptime V: type) type {
         pub fn equalize(
             self: *const Self,
             gpa: Allocator,
+            only: ?Split.Layout,
         ) Allocator.Error!Self {
             if (self.isEmpty()) return .empty;
 
@@ -786,6 +1012,9 @@ pub fn SplitTree(comptime V: type) type {
             for (nodes) |*node| switch (node.*) {
                 .leaf => {},
                 .split => |*s| {
+                    // Only equalize splits with the requested layout, if any.
+                    if (only) |layout| if (s.layout != layout) continue;
+
                     const weight_left = self.weight(s.left, s.layout, 0);
                     const weight_right = self.weight(s.right, s.layout, 0);
                     assert(weight_left > 0);
@@ -2082,7 +2311,7 @@ test "SplitTree: spatial goto" {
     }
 
     // Equalize
-    var equal = try split.equalize(alloc);
+    var equal = try split.equalize(alloc, null);
     defer equal.deinit();
 
     {
@@ -2526,4 +2755,175 @@ test "SplitTree: remove and zoom" {
             \\
         );
     }
+}
+
+test "SplitTree: runs" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var v3: TestTree.View = .{ .label = "C" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+
+    const handle = struct {
+        fn find(tree: *const TestTree, label: []const u8) !TestTree.Node.Handle {
+            var it = tree.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.view.label, label)) return entry.handle;
+            }
+            return error.NotFound;
+        }
+    }.find;
+
+    const expectText = struct {
+        fn expect(tree: *const TestTree, expected: []const u8) !void {
+            const str = try std.fmt.allocPrint(
+                testing.allocator,
+                "{f}",
+                .{std.fmt.alt(tree.*, .formatText)},
+            );
+            defer testing.allocator.free(str);
+            try testing.expectEqualStrings(expected, str);
+        }
+    }.expect;
+
+    // A row of three: A | (B | C), with sizes 0.5, 0.25, 0.25.
+    var splitAB = try t1.split(alloc, .root, .right, 0.5, &t2);
+    defer splitAB.deinit();
+    var split = try splitAB.split(alloc, try handle(&splitAB, "B"), .right, 0.5, &t3);
+    defer split.deinit();
+
+    const inner = split.parent(try handle(&split, "C")).?;
+    try testing.expectEqual(TestTree.Node.Handle.root, split.runRoot(inner));
+    {
+        const sizes = try split.runSizes(alloc, .root);
+        defer alloc.free(sizes);
+        try testing.expectEqualSlices(f64, &.{ 0.5, 0.25, 0.25 }, sizes);
+    }
+
+    // Moving the divider between A and B doesn't resize C.
+    {
+        var resized = try split.clone(alloc);
+        defer resized.deinit();
+        try resized.resizeDividerInPlace(alloc, .root, 0.375);
+        const sizes = try resized.runSizes(alloc, .root);
+        defer alloc.free(sizes);
+        try testing.expectApproxEqAbs(@as(f64, 0.375), sizes[0], 0.001);
+        try testing.expectApproxEqAbs(@as(f64, 0.375), sizes[1], 0.001);
+        try testing.expectApproxEqAbs(@as(f64, 0.25), sizes[2], 0.001);
+    }
+
+    // Moving the divider between B and C doesn't resize A.
+    {
+        var resized = try split.clone(alloc);
+        defer resized.deinit();
+        try resized.resizeDividerInPlace(alloc, inner, 0.75);
+        const sizes = try resized.runSizes(alloc, .root);
+        defer alloc.free(sizes);
+        try testing.expectApproxEqAbs(@as(f64, 0.5), sizes[0], 0.001);
+        try testing.expectApproxEqAbs(@as(f64, 0.375), sizes[1], 0.001);
+        try testing.expectApproxEqAbs(@as(f64, 0.125), sizes[2], 0.001);
+    }
+
+    // A divider can't be moved past the far edge of its neighbors.
+    {
+        var resized = try split.clone(alloc);
+        defer resized.deinit();
+        try resized.resizeDividerInPlace(alloc, .root, 1);
+        const sizes = try resized.runSizes(alloc, .root);
+        defer alloc.free(sizes);
+        try testing.expectApproxEqAbs(@as(f64, 0.75), sizes[0], 0.001);
+        try testing.expectApproxEqAbs(@as(f64, 0), sizes[1], 0.001);
+        try testing.expectApproxEqAbs(@as(f64, 0.25), sizes[2], 0.001);
+    }
+
+    // Removing C normally gives all its space to B.
+    {
+        var removed = try split.remove(alloc, try handle(&split, "C"));
+        defer removed.deinit();
+        try expectText(&removed,
+            \\split (layout: horizontal, ratio: 0.50)
+            \\  leaf: A
+            \\  leaf: B
+            \\
+        );
+    }
+
+    // Removing C with its space distributed keeps A twice the size of B.
+    {
+        var removed = try split.removeDistributed(alloc, try handle(&split, "C"));
+        defer removed.deinit();
+        try expectText(&removed,
+            \\split (layout: horizontal, ratio: 0.67)
+            \\  leaf: A
+            \\  leaf: B
+            \\
+        );
+    }
+
+    // Removing a view from equal thirds leaves equal halves.
+    {
+        var equal = try split.equalize(alloc, null);
+        defer equal.deinit();
+        var removed = try equal.removeDistributed(alloc, try handle(&equal, "A"));
+        defer removed.deinit();
+        try expectText(&removed,
+            \\split (layout: horizontal, ratio: 0.50)
+            \\  leaf: B
+            \\  leaf: C
+            \\
+        );
+    }
+}
+
+test "SplitTree: equalize only one layout" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var v3: TestTree.View = .{ .label = "C" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+
+    // A | (B / C) with uneven ratios everywhere.
+    var splitAB = try t1.split(alloc, .root, .right, 0.2, &t2);
+    defer splitAB.deinit();
+    var split = try splitAB.split(
+        alloc,
+        at: {
+            var it = splitAB.iterator();
+            break :at while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.view.label, "B")) break entry.handle;
+            } else return error.NotFound;
+        },
+        .down,
+        0.2,
+        &t3,
+    );
+    defer split.deinit();
+
+    // Equalizing columns leaves the rows within them alone.
+    var columns = try split.equalize(alloc, .horizontal);
+    defer columns.deinit();
+    const str = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(columns, .formatText)});
+    defer alloc.free(str);
+    try testing.expectEqualStrings(
+        \\split (layout: horizontal, ratio: 0.50)
+        \\  leaf: A
+        \\  split (layout: vertical, ratio: 0.20)
+        \\    leaf: B
+        \\    leaf: C
+        \\
+    , str);
 }

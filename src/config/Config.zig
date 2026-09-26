@@ -1098,6 +1098,24 @@ palette: Palette = .{},
 /// Available since: 1.3.0
 @"split-preserve-zoom": SplitPreserveZoom = .{},
 
+/// Control which splits get the space of a split that is closed.
+///
+/// Valid values:
+///
+///  - `neighbor` *(default)*
+///
+///    The split next to the closed split gets all of its space.
+///
+///  - `distribute`
+///
+///    The space is shared between all the splits in the same row or column
+///    as the closed split, in proportion to their sizes. For example,
+///    closing one of three equally sized splits in a row leaves two equally
+///    sized splits.
+///
+/// Only implemented on Linux.
+@"split-close-space": SplitCloseSpace = .neighbor,
+
 /// The foreground and background color for search matches. This only applies
 /// to non-focused search matches, also known as candidate matches.
 ///
@@ -7236,7 +7254,7 @@ pub const Keybinds = struct {
             try self.set.put(
                 alloc,
                 .{ .key = .{ .unicode = '=' }, .mods = .{ .super = true, .ctrl = true } },
-                .{ .equalize_splits = {} },
+                .{ .equalize_splits = .all },
             );
 
             // Jump to prompt, matches Terminal.app
@@ -8830,6 +8848,12 @@ pub const ShellIntegrationFeatures = packed struct {
 
 pub const SplitPreserveZoom = packed struct {
     navigation: bool = false,
+};
+
+/// See split-close-space
+pub const SplitCloseSpace = enum {
+    neighbor,
+    distribute,
 };
 
 pub const RepeatableCommand = struct {

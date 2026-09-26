@@ -191,7 +191,7 @@ pub const SplitTree = extern struct {
             // All of these will eventually take a target surface parameter.
             // For now all our targets originate from the focused surface.
             .init("new-split", actionNewSplit, s_variant_type),
-            .init("equalize", actionEqualize, null),
+            .init("equalize", actionEqualize, s_variant_type),
             .init("zoom", actionZoom, null),
             .init("close-split", actionCloseSplit, null),
         };
@@ -724,10 +724,29 @@ pub const SplitTree = extern struct {
         parameter_: ?*glib.Variant,
         self: *Self,
     ) callconv(.c) void {
-        _ = parameter_;
+        const target: apprt.action.EqualizeSplits = target: {
+            const parameter = parameter_ orelse break :target .all;
+            var str: ?[*:0]const u8 = null;
+            parameter.get("&s", &str);
+            break :target std.meta.stringToEnum(
+                apprt.action.EqualizeSplits,
+                std.mem.span(str orelse break :target .all),
+            ) orelse {
+                // Need to be defensive here since actions can be triggered externally.
+                log.warn("invalid target for split-tree.equalize: {s}", .{str.?});
+                return;
+            };
+        };
 
         const old_tree = self.getTree() orelse return;
-        var new_tree = old_tree.equalize(Application.default().allocator()) catch |err| {
+        var new_tree = old_tree.equalize(
+            Application.default().allocator(),
+            switch (target) {
+                .all => null,
+                .columns => .horizontal,
+                .rows => .vertical,
+            },
+        ) catch |err| {
             log.warn("unable to equalize tree: {}", .{err});
             return;
         };
@@ -825,10 +844,21 @@ pub const SplitTree = extern struct {
         };
 
         // Remove it from the tree.
-        var new_tree = old_tree.remove(
-            Application.default().allocator(),
-            handle,
-        ) catch |err| {
+        const close_space = close_space: {
+            const config_obj = Application.default().getConfig();
+            defer config_obj.unref();
+            break :close_space config_obj.get().@"split-close-space";
+        };
+        var new_tree = switch (close_space) {
+            .neighbor => old_tree.remove(
+                Application.default().allocator(),
+                handle,
+            ),
+            .distribute => old_tree.removeDistributed(
+                Application.default().allocator(),
+                handle,
+            ),
+        } catch |err| {
             log.warn("unable to remove surface from tree: {}", .{err});
             return;
         };
@@ -973,6 +1003,23 @@ pub const SplitTree = extern struct {
             }
         }
         return 0;
+    }
+
+    /// Update the widgets for splits whose ratios were changed in the tree
+    /// without it being rebuilt, e.g. by resizing a split divider.
+    fn syncSplitWidgets(self: *Self) void {
+        const tree = self.getTree() orelse return;
+        const child = self.private().tree_bin.getChild() orelse return;
+        syncSplitWidget(tree, child);
+    }
+
+    fn syncSplitWidget(tree: *const Surface.Tree, widget: *gtk.Widget) void {
+        const split = gobject.ext.cast(SplitTreeSplit, widget) orelse return;
+        split.syncFromTree(tree);
+
+        const paned = split.private().paned;
+        if (paned.getStartChild()) |v| syncSplitWidget(tree, v);
+        if (paned.getEndChild()) |v| syncSplitWidget(tree, v);
     }
 
     /// Builds the widget tree associated with a surface split tree.
@@ -1239,6 +1286,25 @@ const SplitTreeSplit = extern struct {
         gtk.Widget.initTemplate(self.as(gtk.Widget));
     }
 
+    /// Update this split to match its ratio in the tree, if it was changed
+    /// without the tree being rebuilt.
+    fn syncFromTree(self: *Self, tree: *const Surface.Tree) void {
+        const priv = self.private();
+
+        // Our handle can be out of date if the tree changed and we haven't
+        // been rebuilt yet, in which case we'll be replaced anyway.
+        if (priv.handle.idx() >= tree.nodes.len) return;
+        const split = switch (tree.nodes[priv.handle.idx()]) {
+            .split => |v| v,
+            .leaf => return,
+        };
+
+        const ratio: f64 = split.ratio;
+        if (@abs(ratio - priv.ratio) < 0.001) return;
+        priv.ratio = ratio;
+        self.syncSplitRatio(.tree_to_widget);
+    }
+
     const SyncDirection = enum {
         // Update gtk.Paned widget to match ratio from split tree node.
         tree_to_widget,
@@ -1333,8 +1399,20 @@ const SplitTreeSplit = extern struct {
                 };
                 assert(priv.handle.idx() < tree.nodes.len);
                 assert(tree.nodes[priv.handle.idx()] == .split);
-                tree.resizeInPlace(priv.handle, @floatCast(current_ratio));
+
+                // Only resize the splits on either side of the divider,
+                // rather than everything on each side of this split. Other
+                // splits in the same row or column may need to be updated.
+                tree.resizeDividerInPlace(
+                    Application.default().allocator(),
+                    priv.handle,
+                    @floatCast(current_ratio),
+                ) catch |err| {
+                    log.warn("unable to resize split divider err={}", .{err});
+                    tree.resizeInPlace(priv.handle, @floatCast(current_ratio));
+                };
                 priv.ratio = current_ratio;
+                split_tree.syncSplitWidgets();
             },
         }
     }

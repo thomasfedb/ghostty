@@ -5423,10 +5423,15 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             },
         ),
 
-        .equalize_splits => return try self.rt_app.performAction(
+        .equalize_splits => |target| return try self.rt_app.performAction(
             .{ .surface = self },
             .equalize_splits,
-            {},
+            switch (target) {
+                inline else => |tag| @field(
+                    apprt.action.EqualizeSplits,
+                    @tagName(tag),
+                ),
+            },
         ),
 
         .toggle_split_zoom => return try self.rt_app.performAction(

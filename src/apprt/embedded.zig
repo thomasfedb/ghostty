@@ -2238,7 +2238,7 @@ pub const CAPI = struct {
         _ = ptr.app.performAction(
             .{ .surface = &ptr.core_surface },
             .equalize_splits,
-            {},
+            .all,
         ) catch |err| {
             log.err("error equalizing splits err={}", .{err});
             return;
