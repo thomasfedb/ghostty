@@ -5374,6 +5374,27 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
+        .move_split_to_new_tab => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .move_split_to_new_tab,
+            {},
+        ),
+
+        .merge_tab => |direction| return try self.rt_app.performAction(
+            .{ .surface = self },
+            .merge_tab,
+            switch (direction) {
+                .right => .right,
+                .left => .left,
+                .down => .down,
+                .up => .up,
+                .auto => if (self.size.screen.width > self.size.screen.height)
+                    .right
+                else
+                    .down,
+            },
+        ),
+
         .new_split => |direction| return try self.rt_app.performAction(
             .{ .surface = self },
             .new_split,
@@ -5395,6 +5416,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             switch (direction) {
                 inline else => |tag| @field(
                     apprt.action.GotoSplit,
+                    @tagName(tag),
+                ),
+            },
+        ),
+
+        .swap_split => |target| return try self.rt_app.performAction(
+            .{ .surface = self },
+            .swap_split,
+            switch (target) {
+                inline else => |tag| @field(
+                    apprt.action.SwapSplit,
                     @tagName(tag),
                 ),
             },

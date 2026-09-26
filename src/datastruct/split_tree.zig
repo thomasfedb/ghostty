@@ -282,6 +282,115 @@ pub fn SplitTree(comptime V: type) type {
             };
         }
 
+        /// Returns the nearest view in the given direction from the given
+        /// view, or null if there is none. Unlike `goto` with a spatial
+        /// direction, this never wraps around to the other side.
+        ///
+        /// If `prefer` is a view in the given direction then it is returned
+        /// even if it isn't the nearest. There can be several views in a
+        /// direction, e.g. to the side of a tall view, and this allows
+        /// choosing one that was previously used.
+        ///
+        /// Allocator is only used for temporary state.
+        pub fn nearestInDirection(
+            self: *const Self,
+            alloc: Allocator,
+            from: Node.Handle,
+            direction: Spatial.Direction,
+            prefer: ?Node.Handle,
+        ) Allocator.Error!?Node.Handle {
+            var sp = try self.spatial(alloc);
+            defer sp.deinit(alloc);
+            const target = sp.slots[from.idx()];
+
+            if (prefer) |handle| preferred: {
+                if (handle == from) break :preferred;
+                switch (self.nodes[handle.idx()]) {
+                    .leaf => {},
+                    .split => break :preferred,
+                }
+                if (isInDirection(sp.slots[handle.idx()], target, direction)) {
+                    return handle;
+                }
+            }
+
+            return self.nearest(sp, from, direction, target);
+        }
+
+        /// Returns true if the slot is entirely in the given direction from
+        /// the target slot.
+        fn isInDirection(
+            slot: Spatial.Slot,
+            target: Spatial.Slot,
+            direction: Spatial.Direction,
+        ) bool {
+            return switch (direction) {
+                .left => slot.maxX() <= target.x,
+                .right => slot.x >= target.maxX(),
+                .up => slot.maxY() <= target.y,
+                .down => slot.y >= target.maxY(),
+            };
+        }
+
+        /// Swap the views at two leaf nodes, returning a new tree. The
+        /// layout of the tree, including split ratios, is unchanged.
+        ///
+        /// The allocator will be used for the newly created tree.
+        pub fn swap(
+            self: *const Self,
+            gpa: Allocator,
+            a: Node.Handle,
+            b: Node.Handle,
+        ) Allocator.Error!Self {
+            assert(self.nodes[a.idx()] == .leaf);
+            assert(self.nodes[b.idx()] == .leaf);
+
+            var result = try self.clone(gpa);
+            const nodes: []Node = @constCast(result.nodes);
+            std.mem.swap(Node, &nodes[a.idx()], &nodes[b.idx()]);
+
+            // Swapping moves views to different positions, so the zoomed
+            // view would change.
+            result.zoomed = null;
+            return result;
+        }
+
+        /// Swap the two sides of the split containing the given node,
+        /// returning a new tree. The ratio is inverted so that each side
+        /// keeps its size. Returns null if the node is the root, since it
+        /// isn't in a split.
+        ///
+        /// The allocator will be used for the newly created tree.
+        pub fn swapSiblings(
+            self: *const Self,
+            gpa: Allocator,
+            at: Node.Handle,
+        ) Allocator.Error!?Self {
+            const parent_handle = self.parent(at) orelse return null;
+
+            var result = try self.clone(gpa);
+            const nodes: []Node = @constCast(result.nodes);
+            const s = &nodes[parent_handle.idx()].split;
+            std.mem.swap(Node.Handle, &s.left, &s.right);
+            s.ratio = 1 - s.ratio;
+
+            result.zoomed = null;
+            return result;
+        }
+
+        /// Returns the split node that directly contains the given node,
+        /// or null if it is the root.
+        fn parent(self: *const Self, child: Node.Handle) ?Node.Handle {
+            for (self.nodes, 0..) |node, i| switch (node) {
+                .leaf => {},
+                .split => |s| if (s.left == child or s.right == child) {
+                    return @enumFromInt(i);
+                },
+            };
+
+            return null;
+        }
+
         pub const Side = enum { left, right };
 
         /// Returns the deepest view in the tree in the given direction.
@@ -421,12 +530,7 @@ pub fn SplitTree(comptime V: type) type {
                 }
 
                 // Ensure it is in the proper direction
-                if (!switch (direction) {
-                    .left => slot.maxX() <= target.x,
-                    .right => slot.x >= target.maxX(),
-                    .up => slot.maxY() <= target.y,
-                    .down => slot.y >= target.maxY(),
-                }) continue;
+                if (!isInDirection(slot, target, direction)) continue;
 
                 // Track our distance
                 const dx = slot.x - target.x;
@@ -2526,4 +2630,134 @@ test "SplitTree: remove and zoom" {
             \\
         );
     }
+}
+
+test "SplitTree: swap" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var v3: TestTree.View = .{ .label = "C" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+
+    // A | (B / C)
+    var splitAB = try t1.split(alloc, .root, .right, 0.5, &t2);
+    defer splitAB.deinit();
+    var split = try splitAB.split(
+        alloc,
+        at: {
+            var it = splitAB.iterator();
+            break :at while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.view.label, "B")) {
+                    break entry.handle;
+                }
+            } else return error.NotFound;
+        },
+        .down,
+        0.3,
+        &t3,
+    );
+    defer split.deinit();
+
+    const handle = struct {
+        fn find(tree: *const TestTree, label: []const u8) !TestTree.Node.Handle {
+            var it = tree.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.view.label, label)) return entry.handle;
+            }
+            return error.NotFound;
+        }
+    }.find;
+
+    // Directional lookups don't wrap around.
+    try testing.expectEqual(
+        try handle(&split, "A"),
+        (try split.nearestInDirection(alloc, try handle(&split, "C"), .left, null)).?,
+    );
+    try testing.expectEqual(
+        try handle(&split, "B"),
+        (try split.nearestInDirection(alloc, try handle(&split, "C"), .up, null)).?,
+    );
+    try testing.expect(try split.nearestInDirection(alloc, try handle(&split, "A"), .left, null) == null);
+    try testing.expect(try split.nearestInDirection(alloc, try handle(&split, "C"), .down, null) == null);
+
+    // To the right of the tall view A, B is nearest but C can be preferred.
+    try testing.expectEqual(
+        try handle(&split, "B"),
+        (try split.nearestInDirection(alloc, try handle(&split, "A"), .right, null)).?,
+    );
+    try testing.expectEqual(
+        try handle(&split, "C"),
+        (try split.nearestInDirection(
+            alloc,
+            try handle(&split, "A"),
+            .right,
+            try handle(&split, "C"),
+        )).?,
+    );
+
+    // A preferred view that isn't in the direction is ignored.
+    try testing.expect(try split.nearestInDirection(
+        alloc,
+        try handle(&split, "A"),
+        .left,
+        try handle(&split, "C"),
+    ) == null);
+
+    // Swapping two views keeps the layout.
+    {
+        var swapped = try split.swap(alloc, try handle(&split, "A"), try handle(&split, "C"));
+        defer swapped.deinit();
+        const str = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(swapped, .formatText)});
+        defer alloc.free(str);
+        try testing.expectEqualStrings(
+            \\split (layout: horizontal, ratio: 0.50)
+            \\  leaf: C
+            \\  split (layout: vertical, ratio: 0.30)
+            \\    leaf: B
+            \\    leaf: A
+            \\
+        , str);
+    }
+
+    // Swapping siblings inverts the ratio so sizes are kept.
+    {
+        var swapped = (try split.swapSiblings(alloc, try handle(&split, "C"))).?;
+        defer swapped.deinit();
+        const str = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(swapped, .formatText)});
+        defer alloc.free(str);
+        try testing.expectEqualStrings(
+            \\split (layout: horizontal, ratio: 0.50)
+            \\  leaf: A
+            \\  split (layout: vertical, ratio: 0.70)
+            \\    leaf: C
+            \\    leaf: B
+            \\
+        , str);
+    }
+
+    // A sibling can be a whole split.
+    {
+        var swapped = (try split.swapSiblings(alloc, try handle(&split, "A"))).?;
+        defer swapped.deinit();
+        const str = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(swapped, .formatText)});
+        defer alloc.free(str);
+        try testing.expectEqualStrings(
+            \\split (layout: horizontal, ratio: 0.50)
+            \\  split (layout: vertical, ratio: 0.30)
+            \\    leaf: B
+            \\    leaf: C
+            \\  leaf: A
+            \\
+        , str);
+    }
+
+    // A tree with a single view has no sibling.
+    try testing.expect(try t1.swapSiblings(alloc, .root) == null);
 }

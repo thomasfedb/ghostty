@@ -357,6 +357,16 @@ pub const Action = union(Key) {
     /// Move a tab to a new window.
     move_tab_to_new_window,
 
+    /// Move the target split out of its tab and into a new tab.
+    move_split_to_new_tab,
+
+    /// Merge the target's tab into an adjacent tab, placing it on the
+    /// given side of that tab's focused split.
+    merge_tab: SplitDirection,
+
+    /// Swap the target split with another split, keeping the layout.
+    swap_split: SwapSplit,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -428,6 +438,9 @@ pub const Action = union(Key) {
         readonly,
         copy_title_to_clipboard,
         move_tab_to_new_window,
+        move_split_to_new_tab,
+        merge_tab,
+        swap_split,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -528,6 +541,18 @@ pub const GotoSplit = enum(c_int) {
 
     test "ghostty.h GotoSplit" {
         try lib.checkGhosttyHEnum(GotoSplit, "GHOSTTY_GOTO_SPLIT_");
+    }
+};
+
+pub const SwapSplit = enum(c_int) {
+    sibling,
+    up,
+    left,
+    down,
+    right,
+
+    test "ghostty.h SwapSplit" {
+        try lib.checkGhosttyHEnum(SwapSplit, "GHOSTTY_SWAP_SPLIT_");
     }
 };
 

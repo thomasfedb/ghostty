@@ -590,6 +590,36 @@ pub const Action = union(enum) {
     /// Move a tab to a new window.
     move_tab_to_new_window,
 
+    /// Move the focused split out of its tab and into a new tab of its
+    /// own in the same window.
+    ///
+    /// This does nothing if the focused split is the only split in its tab.
+    ///
+    /// Only implemented on Linux.
+    move_split_to_new_tab,
+
+    /// Merge the current tab into the previous tab as a split. All of the
+    /// splits in the current tab are moved next to the focused split of
+    /// the previous tab (or the next tab, if the current tab is the first
+    /// tab) and the current tab is closed.
+    ///
+    /// The argument specifies which side of the focused split the merged
+    /// tab is placed on:
+    ///
+    ///   - `right`, `down`, `left`, `up`
+    ///
+    ///     Places the merged tab on the corresponding side.
+    ///
+    ///   - `auto`
+    ///
+    ///     Places the merged tab along the larger direction of the
+    ///     current terminal, in the same way as `new_split:auto`.
+    ///
+    /// This does nothing if the window only has one tab.
+    ///
+    /// Only implemented on Linux.
+    merge_tab: SplitDirection,
+
     /// Toggle the tab overview.
     ///
     /// This is only supported on Linux and when the system's libadwaita
@@ -649,6 +679,26 @@ pub const Action = union(enum) {
     /// `left` and `up`), or in the adjacent split in the order of creation
     /// (`previous` and `next`).
     goto_split: SplitFocusDirection,
+
+    /// Swap the focused split with another split, keeping the layout and
+    /// the sizes of the splits the same. Focus stays with the focused split,
+    /// so repeating the action keeps moving it.
+    ///
+    /// Valid arguments:
+    ///
+    ///   - `right`, `down`, `left`, `up`
+    ///
+    ///     Swap with the nearest split in the corresponding direction.
+    ///     This does nothing if there is no split in that direction.
+    ///
+    ///   - `sibling`
+    ///
+    ///     Swap the two sides of the split that the focused split is in.
+    ///     The other side may contain more than one split, in which case
+    ///     they all move together.
+    ///
+    /// Only implemented on Linux.
+    swap_split: SplitSwapTarget,
 
     /// Focus on either the previous window or the next one ('previous', 'next')
     goto_window: GotoWindow,
@@ -1100,6 +1150,14 @@ pub const Action = union(enum) {
         }
     };
 
+    pub const SplitSwapTarget = enum {
+        sibling,
+        up,
+        left,
+        down,
+        right,
+    };
+
     pub const SplitResizeDirection = enum {
         up,
         down,
@@ -1450,8 +1508,11 @@ pub const Action = union(enum) {
             .goto_tab,
             .move_tab,
             .move_tab_to_new_window,
+            .move_split_to_new_tab,
+            .merge_tab,
             .toggle_tab_overview,
             .new_split,
+            .swap_split,
             .goto_split,
             .goto_window,
             .toggle_split_zoom,

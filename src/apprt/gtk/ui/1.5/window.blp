@@ -23,6 +23,8 @@ template $GhosttyWindow: Adw.ApplicationWindow {
   content: Adw.TabOverview tab_overview {
     create-tab => $overview_create_tab();
     notify::open => $overview_notify_open();
+    extra-drag-drop => $overview_extra_drag_drop();
+    extra-drag-value => $overview_extra_drag_value();
     view: tab_view;
     enable-new-tab: true;
     // Disable the title buttons (close, maximize, minimize, ...)
@@ -72,6 +74,11 @@ template $GhosttyWindow: Adw.ApplicationWindow {
             active: bind tab_overview.open bidirectional;
             can-focus: false;
             focus-on-click: false;
+
+            DropControllerMotion {
+              enter => $overview_button_drag_enter();
+              leave => $overview_button_drag_leave();
+            }
           }
 
           Gtk.MenuButton {
@@ -86,6 +93,8 @@ template $GhosttyWindow: Adw.ApplicationWindow {
 
       [top]
       Adw.TabBar tab_bar {
+        extra-drag-drop => $tab_bar_extra_drag_drop();
+        extra-drag-value => $tab_bar_extra_drag_value();
         autohide: bind template.tabs-autohide;
         expand-tabs: bind template.tabs-wide;
         view: tab_view;
@@ -130,6 +139,11 @@ template $GhosttyWindow: Adw.ApplicationWindow {
             active: bind tab_overview.open bidirectional;
             can-focus: false;
             focus-on-click: false;
+
+            DropControllerMotion {
+              enter => $overview_button_drag_enter();
+              leave => $overview_button_drag_leave();
+            }
           }
 
           Gtk.MenuButton {

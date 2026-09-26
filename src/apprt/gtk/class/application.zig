@@ -703,6 +703,8 @@ pub const Application = extern struct {
 
             .goto_split => return Action.gotoSplit(target, value),
 
+            .swap_split => return Action.swapSplit(target, value),
+
             .goto_window => return Action.gotoWindow(value),
 
             .goto_tab => return Action.gotoTab(target, value),
@@ -725,6 +727,8 @@ pub const Application = extern struct {
 
             .move_tab => return Action.moveTab(target, value),
             .move_tab_to_new_window => return Action.moveTabToNewWindow(target),
+            .move_split_to_new_tab => return Action.moveSplitToNewTab(target),
+            .merge_tab => return Action.mergeTab(target, value),
 
             .new_split => return Action.newSplit(target, value),
 
@@ -2447,6 +2451,27 @@ const Action = struct {
         }
     }
 
+    pub fn swapSplit(
+        target: apprt.Target,
+        to: apprt.action.SwapSplit,
+    ) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |core| {
+                const surface = core.rt_surface.surface;
+                const tree = SplitTree.fromSurface(surface) orelse {
+                    log.warn("surface is not in a split tree, ignoring swap_split", .{});
+                    return false;
+                };
+
+                return tree.swap(surface, to) catch |err| {
+                    log.warn("unable to swap split err={}", .{err});
+                    return false;
+                };
+            },
+        }
+    }
+
     pub fn gotoTab(
         target: apprt.Target,
         tab: apprt.action.GotoTab,
@@ -2628,6 +2653,52 @@ const Action = struct {
                 };
 
                 return window.moveTabToNewWindow(surface);
+            },
+        }
+    }
+
+    pub fn moveSplitToNewTab(
+        target: apprt.Target,
+    ) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |core| {
+                const surface = core.rt_surface.surface;
+                const window = ext.getAncestor(
+                    Window,
+                    surface.as(gtk.Widget),
+                ) orelse {
+                    log.warn("surface is not in a window, ignoring move_split_to_new_tab", .{});
+                    return false;
+                };
+
+                return window.moveSplitToNewTab(surface);
+            },
+        }
+    }
+
+    pub fn mergeTab(
+        target: apprt.Target,
+        direction: apprt.action.SplitDirection,
+    ) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |core| {
+                const surface = core.rt_surface.surface;
+                const window = ext.getAncestor(
+                    Window,
+                    surface.as(gtk.Widget),
+                ) orelse {
+                    log.warn("surface is not in a window, ignoring merge_tab", .{});
+                    return false;
+                };
+
+                return window.mergeTab(surface, switch (direction) {
+                    .right => .right,
+                    .left => .left,
+                    .down => .down,
+                    .up => .up,
+                });
             },
         }
     }

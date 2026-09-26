@@ -266,6 +266,21 @@ pub const Window = extern struct {
         /// See tabOverviewOpen for why we have this.
         tab_overview_focus_timer: ?c_uint = null,
 
+        /// Timer to open the tab overview while a split is dragged over
+        /// the tab overview button.
+        tab_overview_drag_timer: ?c_uint = null,
+
+        /// The surface that a tab being dragged is over, and the side of
+        /// the surface that the tab would be placed on if dropped.
+        tab_drag_target: WeakRef(Surface) = .empty,
+        tab_drag_direction: Surface.Tree.Split.Direction = .right,
+
+        /// True if the tab being dragged was dropped onto tab_drag_target,
+        /// so it should be merged into it once libadwaita attaches it to
+        /// our tab view. libadwaita also attaches it if the drag is
+        /// cancelled, in which case it must not be merged.
+        tab_drag_dropped: bool = false,
+
         /// A weak reference to a command palette.
         command_palette: WeakRef(CommandPalette) = .empty,
 
@@ -344,6 +359,109 @@ pub const Window = extern struct {
 
         // Initialize our actions
         self.initActionMap();
+
+        // Allow splits to be dragged onto tabs in the tab bar and the tab
+        // overview, and onto empty space in the tab bar to create a new
+        // tab. Splits are dragged as their surface ID.
+        var surface_drop_types = [_]gobject.Type{gobject.ext.types.uint64};
+        priv.tab_bar.setupExtraDropTarget(
+            .{ .move = true },
+            &surface_drop_types,
+            surface_drop_types.len,
+        );
+        priv.tab_overview.setupExtraDropTarget(
+            .{ .move = true },
+            &surface_drop_types,
+            surface_drop_types.len,
+        );
+        {
+            const drop_target = gtk.DropTarget.new(
+                gobject.ext.types.uint64,
+                .{ .move = true },
+            );
+            _ = gtk.DropTarget.signals.drop.connect(
+                drop_target,
+                *Self,
+                tabBarDrop,
+                self,
+                .{},
+            );
+            priv.tab_bar.as(gtk.Widget).addController(
+                drop_target.as(gtk.EventController),
+            );
+        }
+
+        // Track tabs dragged over our surfaces so that they can be merged
+        // into the surface they're dropped onto. While a tab is dragged,
+        // libadwaita makes the contents of all tabs non-targetable so that
+        // the tab is dropped onto the tab view itself, which means drop
+        // targets on surfaces never see the drag. Instead we watch the
+        // drag from here and wait for libadwaita to attach the dropped tab
+        // to our tab view (see tabViewPageAttached).
+        {
+            const motion = gtk.DropControllerMotion.new();
+            motion.as(gtk.EventController).setPropagationPhase(.capture);
+            _ = gtk.DropControllerMotion.signals.enter.connect(
+                motion,
+                *Self,
+                tabDragMotion,
+                self,
+                .{},
+            );
+            _ = gtk.DropControllerMotion.signals.motion.connect(
+                motion,
+                *Self,
+                tabDragMotion,
+                self,
+                .{},
+            );
+            _ = gtk.DropControllerMotion.signals.leave.connect(
+                motion,
+                *Self,
+                tabDragLeave,
+                self,
+                .{},
+            );
+            priv.tab_overview.as(gtk.Widget).addController(
+                motion.as(gtk.EventController),
+            );
+
+            // Watch for the drop itself without handling it, so that
+            // libadwaita still gets it.
+            const legacy = gtk.EventControllerLegacy.new();
+            legacy.as(gtk.EventController).setPropagationPhase(.capture);
+            _ = gtk.EventControllerLegacy.signals.event.connect(
+                legacy,
+                *Self,
+                tabDragEvent,
+                self,
+                .{},
+            );
+            priv.tab_overview.as(gtk.Widget).addController(
+                legacy.as(gtk.EventController),
+            );
+        }
+
+        // Catch splits dropped anywhere else in the window. In the tab
+        // overview this creates a new tab. Otherwise this does nothing,
+        // but it prevents the split from being moved to a new window as
+        // though it was dropped outside of any window.
+        {
+            const drop_target = gtk.DropTarget.new(
+                gobject.ext.types.uint64,
+                .{ .move = true },
+            );
+            _ = gtk.DropTarget.signals.drop.connect(
+                drop_target,
+                *Self,
+                windowDrop,
+                self,
+                .{},
+            );
+            priv.tab_overview.as(gtk.Widget).addController(
+                drop_target.as(gtk.EventController),
+            );
+        }
 
         // Start states based on config.
         if (config.maximize) self.as(gtk.Window).maximize();
@@ -462,7 +580,6 @@ pub const Window = extern struct {
         },
     ) *adw.TabPage {
         const priv: *Private = self.private();
-        const tab_view = priv.tab_view;
 
         // Create our new tab object
         const tab = Tab.new(
@@ -482,6 +599,25 @@ pub const Window = extern struct {
             }
             tab.setParentWithContext(p, context);
         }
+
+        return self.insertTabPage(tab);
+    }
+
+    /// Create a new tab page containing the surfaces of an existing tree.
+    /// The surfaces must first be removed from any other tree they are in.
+    fn newTabPageForTree(
+        self: *Self,
+        tree: *const Surface.Tree,
+        focus: ?*Surface,
+    ) *adw.TabPage {
+        const tab = Tab.newForTree(self.private().config, tree, focus);
+        return self.insertTabPage(tab);
+    }
+
+    /// Insert a tab into our tab view and select it.
+    fn insertTabPage(self: *Self, tab: *Tab) *adw.TabPage {
+        const priv: *Private = self.private();
+        const tab_view = priv.tab_view;
 
         // Get the position that we should insert the new tab at.
         const config = if (priv.config) |v| v.get() else {
@@ -516,25 +652,6 @@ pub const Window = extern struct {
             page.as(gobject.Object),
             "tooltip",
             .{ .sync_create = true },
-        );
-
-        // Bind signals
-        const split_tree = tab.getSplitTree();
-        _ = SplitTree.signals.changed.connect(
-            split_tree,
-            *Self,
-            tabSplitTreeChanged,
-            self,
-            .{},
-        );
-
-        // Run an initial notification for the surface tree so we can setup
-        // initial state.
-        tabSplitTreeChanged(
-            split_tree,
-            null,
-            split_tree.getTree(),
-            self,
         );
 
         return page;
@@ -658,6 +775,244 @@ pub const Window = extern struct {
             0,
         );
         window.as(gtk.Window).present();
+        return true;
+    }
+
+    /// Move the given surface out of its tab and into a new tab in this
+    /// window. The surface may currently be in any window. Returns true
+    /// if the surface was moved.
+    pub fn moveSplitToNewTab(self: *Self, surface: *Surface) bool {
+        const source = SplitTree.fromSurface(surface) orelse return false;
+
+        // Moving the only split of one of our own tabs into a new tab
+        // would change nothing.
+        if (!source.getIsSplit() and
+            ext.getAncestor(Self, source.as(gtk.Widget)) == self) return false;
+
+        var tree = takeSurface(source, surface) orelse return false;
+        defer tree.deinit();
+        _ = self.newTabPageForTree(&tree, surface);
+        self.as(gtk.Window).present();
+        return true;
+    }
+
+    /// Move the given surface out of its tab and into a new window.
+    /// Returns true if the surface was moved.
+    pub fn moveSplitToNewWindow(surface: *Surface) bool {
+        const source = SplitTree.fromSurface(surface) orelse return false;
+
+        // If this is the only split in its tab then it would be moving
+        // the whole tab, which isn't what we're here for.
+        if (!source.getIsSplit()) return false;
+
+        var tree = takeSurface(source, surface) orelse return false;
+        defer tree.deinit();
+
+        const window = Window.new(Application.default(), .none);
+        _ = window.newTabPageForTree(&tree, surface);
+        window.as(gtk.Window).present();
+        return true;
+    }
+
+    /// Merge the tab containing the given surface into the previous tab
+    /// (or the next tab if it is the first tab), placing its splits on
+    /// the given side of that tab's active surface. Returns true if the
+    /// tab was merged.
+    pub fn mergeTab(
+        self: *Self,
+        surface: *Surface,
+        direction: Surface.Tree.Split.Direction,
+    ) bool {
+        const tab_view = self.private().tab_view;
+        if (tab_view.getNPages() < 2) return false;
+
+        const source = ext.getAncestor(
+            Tab,
+            surface.as(gtk.Widget),
+        ) orelse return false;
+        const pos = tab_view.getPagePosition(tab_view.getPage(source.as(gtk.Widget)));
+        const target_page = tab_view.getNthPage(if (pos > 0) pos - 1 else pos + 1);
+        const target = gobject.ext.cast(
+            Tab,
+            target_page.getChild(),
+        ) orelse return false;
+
+        // Select the target first, since selecting a tab restores its
+        // previous focus rather than focusing the merged splits.
+        tab_view.setSelectedPage(target_page);
+        return mergeTabInto(source, target.getSplitTree(), null, direction) != null;
+    }
+
+    /// Set the surface that a tab being dragged would be merged into if it
+    /// was dropped, showing where it would be placed on the surface.
+    fn setTabDragTarget(
+        self: *Self,
+        target_: ?*Surface,
+        direction: Surface.Tree.Split.Direction,
+    ) void {
+        const priv = self.private();
+        if (priv.tab_drag_target.get()) |old| {
+            defer old.unref();
+            if (old != target_) old.setDropOverlayDirection(null);
+        }
+
+        priv.tab_drag_dropped = false;
+        priv.tab_drag_target.set(target_);
+        priv.tab_drag_direction = direction;
+        if (target_) |target| target.setDropOverlayDirection(direction);
+    }
+
+    /// Merge a tab into the given surface's tree once we're back on the
+    /// main loop, since this is called while libadwaita is attaching it.
+    fn mergeTabLater(
+        self: *Self,
+        tab: *Tab,
+        target: *Surface,
+        direction: Surface.Tree.Split.Direction,
+    ) void {
+        const alloc = Application.default().allocator();
+        const merge = alloc.create(TabMerge) catch return;
+        merge.* = .{
+            .window = self.ref(),
+            .tab = tab.ref(),
+            .target = target.ref(),
+            .direction = direction,
+        };
+        _ = glib.idleAddOnce(TabMerge.run, merge);
+    }
+
+    const TabMerge = struct {
+        window: *Self,
+        tab: *Tab,
+        target: *Surface,
+        direction: Surface.Tree.Split.Direction,
+
+        fn run(ud: ?*anyopaque) callconv(.c) void {
+            const merge: *TabMerge = @ptrCast(@alignCast(ud orelse return));
+            defer {
+                merge.window.unref();
+                merge.tab.unref();
+                merge.target.unref();
+                Application.default().allocator().destroy(merge);
+            }
+
+            // Both the tab and the surface must still be in our window.
+            const self = merge.window;
+            const tab_view = self.private().tab_view;
+            if (ext.getAncestor(Self, merge.tab.as(gtk.Widget)) != self) return;
+            const target_tab = ext.getAncestor(
+                Tab,
+                merge.target.as(gtk.Widget),
+            ) orelse return;
+            if (target_tab == merge.tab) return;
+            if (ext.getAncestor(Self, target_tab.as(gtk.Widget)) != self) return;
+            const split_tree = SplitTree.fromSurface(merge.target) orelse return;
+
+            // Select the target first, since selecting a tab restores its
+            // previous focus rather than focusing the merged splits.
+            tab_view.setSelectedPage(tab_view.getPage(target_tab.as(gtk.Widget)));
+            _ = mergeTabInto(merge.tab, split_tree, merge.target, merge.direction);
+        }
+    };
+
+    /// Remove the given surface from its split tree without closing it,
+    /// returning a new tree containing only the surface.
+    fn takeSurface(source: *SplitTree, surface: *Surface) ?Surface.Tree {
+        // Create the new tree first so that it keeps the surface
+        // referenced while it's removed from the source tree.
+        var tree = Surface.Tree.init(
+            Application.default().allocator(),
+            surface,
+        ) catch return null;
+        source.removeSurface(surface) catch {
+            tree.deinit();
+            return null;
+        };
+        return tree;
+    }
+
+    /// Move all the surfaces of the source tab into the target split tree,
+    /// placing them on the given side of the target surface (or the target
+    /// tree's active surface if null). This leaves the source tab empty,
+    /// which closes it if it's in a window.
+    ///
+    /// Returns the moved surface that is now focused, or null if the tab
+    /// couldn't be merged.
+    fn mergeTabInto(
+        source: *Tab,
+        target: *SplitTree,
+        target_surface: ?*Surface,
+        direction: Surface.Tree.Split.Direction,
+    ) ?*Surface {
+        const source_split_tree = source.getSplitTree();
+        const source_tree = source_split_tree.getTree() orelse return null;
+
+        // Copy the tree so that the surfaces stay referenced while they're
+        // removed from the source tree.
+        var tree = source_tree.clone(Application.default().allocator()) catch return null;
+        defer tree.deinit();
+        tree.zoomed = null;
+        const focus = source_split_tree.getActiveSurface() orelse
+            tree.nodes[tree.deepest(.left, .root).idx()].leaf;
+
+        // The source tree must be cleared before the surfaces are inserted
+        // into the target tree so that handlers connected for the target
+        // tree aren't disconnected by the source tree changing.
+        source_split_tree.setTree(null);
+        target.insertTree(&tree, target_surface, direction) catch |err| {
+            log.warn("unable to merge tab err={}", .{err});
+            return null;
+        };
+        target.focusSurface(focus);
+        return focus;
+    }
+
+    /// Returns the surface for a surface ID that was dragged and dropped.
+    fn droppedSurface(value: *const gobject.Value) ?*Surface {
+        if (!ext.gValueHolds(value, gobject.ext.types.uint64)) return null;
+        const core = Application.default().core().findSurfaceByID(
+            value.getUint64(),
+        ) orelse return null;
+        return core.rt_surface.gobj();
+    }
+
+    /// Returns the drag action for a surface dragged over a tab (in the tab
+    /// bar or the tab overview). Surfaces can't be dropped onto their own tab.
+    fn surfaceDragActionForPage(
+        page: *adw.TabPage,
+        value: ?*const gobject.Value,
+    ) gdk.DragAction {
+        const surface = droppedSurface(value orelse return .{}) orelse return .{};
+        const tab = gobject.ext.cast(Tab, page.getChild()) orelse return .{};
+        const source = SplitTree.fromSurface(surface) orelse return .{};
+        if (source == tab.getSplitTree()) return .{};
+        return .{ .move = true };
+    }
+
+    /// Move a surface that was dropped onto a tab (in the tab bar or the
+    /// tab overview) into that tab. Returns true if the surface was moved.
+    fn dropSurfaceOnPage(
+        self: *Self,
+        page: *adw.TabPage,
+        value: *const gobject.Value,
+    ) bool {
+        const surface = droppedSurface(value) orelse return false;
+        const tab = gobject.ext.cast(Tab, page.getChild()) orelse return false;
+        const split_tree = tab.getSplitTree();
+
+        // Nothing to do if the surface is already in this tab.
+        const source = SplitTree.fromSurface(surface) orelse return false;
+        if (source == split_tree) return false;
+
+        // Select the tab first, since selecting a tab restores its
+        // previous focus rather than focusing the moved split.
+        self.private().tab_view.setSelectedPage(page);
+        split_tree.moveSplit(surface, null, .right) catch |err| {
+            log.warn("unable to move split to tab err={}", .{err});
+            return false;
+        };
+
+        self.as(gtk.Window).present();
         return true;
     }
 
@@ -1404,6 +1759,15 @@ pub const Window = extern struct {
             priv.handle_active_state_source = null;
         }
 
+        if (priv.tab_overview_drag_timer) |v| {
+            if (glib.Source.remove(v) == 0) {
+                log.warn("unable to remove tab overview drag timer", .{});
+            }
+            priv.tab_overview_drag_timer = null;
+        }
+
+        priv.tab_drag_target.deinit();
+
         priv.command_palette.deinit();
 
         if (priv.config) |v| {
@@ -1570,6 +1934,179 @@ pub const Window = extern struct {
         return 0;
     }
 
+    fn tabBarExtraDragValue(
+        _: *adw.TabBar,
+        page: *adw.TabPage,
+        value: ?*gobject.Value,
+        _: *Self,
+    ) callconv(.c) gdk.DragAction {
+        return surfaceDragActionForPage(page, value);
+    }
+
+    fn tabOverviewExtraDragValue(
+        _: *adw.TabOverview,
+        page: *adw.TabPage,
+        value: ?*gobject.Value,
+        _: *Self,
+    ) callconv(.c) gdk.DragAction {
+        return surfaceDragActionForPage(page, value);
+    }
+
+    fn tabBarExtraDragDrop(
+        tab_bar: *adw.TabBar,
+        page: *adw.TabPage,
+        value: *gobject.Value,
+        self: *Self,
+    ) callconv(.c) c_int {
+        // The drop target on the tab bar itself (see init) doesn't see the
+        // drag leave when a tab handles the drop, so it would otherwise
+        // stay highlighted.
+        tab_bar.as(gtk.Widget).unsetStateFlags(.{ .drop_active = true });
+        return @intFromBool(self.dropSurfaceOnPage(page, value));
+    }
+
+    fn tabOverviewExtraDragDrop(
+        tab_overview: *adw.TabOverview,
+        page: *adw.TabPage,
+        value: *gobject.Value,
+        self: *Self,
+    ) callconv(.c) c_int {
+        if (!self.dropSurfaceOnPage(page, value)) return @intFromBool(false);
+        tab_overview.setOpen(@intFromBool(false));
+        return @intFromBool(true);
+    }
+
+    fn tabBarDrop(
+        _: *gtk.DropTarget,
+        value: *gobject.Value,
+        _: f64,
+        _: f64,
+        self: *Self,
+    ) callconv(.c) c_int {
+        const surface = droppedSurface(value) orelse return @intFromBool(false);
+        return @intFromBool(self.moveSplitToNewTab(surface));
+    }
+
+    fn windowDrop(
+        _: *gtk.DropTarget,
+        value: *gobject.Value,
+        _: f64,
+        _: f64,
+        self: *Self,
+    ) callconv(.c) c_int {
+        const surface = droppedSurface(value) orelse return @intFromBool(false);
+
+        // Outside of the tab overview we accept the drop without doing
+        // anything. See where this drop target is set up in init.
+        const tab_overview = self.private().tab_overview;
+        if (tab_overview.getOpen() == 0) return @intFromBool(true);
+
+        if (!self.moveSplitToNewTab(surface)) return @intFromBool(false);
+        tab_overview.setOpen(@intFromBool(false));
+        return @intFromBool(true);
+    }
+
+    fn tabDragMotion(
+        controller: *gtk.DropControllerMotion,
+        x: f64,
+        y: f64,
+        self: *Self,
+    ) callconv(.c) void {
+        const target: ?*Surface, const direction: Surface.Tree.Split.Direction = target: {
+            const drop = controller.getDrop() orelse break :target .{ null, .right };
+            const formats = drop.getFormats();
+            if (formats.containGtype(adw.TabPage.getGObjectType()) == 0) {
+                break :target .{ null, .right };
+            }
+
+            // Find the surface under the pointer, if any. libadwaita makes
+            // the contents of all tabs non-targetable while a tab is dragged.
+            const widget = controller.as(gtk.EventController).getWidget() orelse
+                break :target .{ null, .right };
+            const picked = widget.pick(
+                x,
+                y,
+                .{ .non_targetable = true },
+            ) orelse break :target .{ null, .right };
+            const surface = ext.getAncestor(Surface, picked) orelse
+                break :target .{ null, .right };
+
+            var surface_x: f64 = 0;
+            var surface_y: f64 = 0;
+            if (widget.translateCoordinates(
+                surface.as(gtk.Widget),
+                x,
+                y,
+                &surface_x,
+                &surface_y,
+            ) == 0) break :target .{ null, .right };
+
+            break :target .{ surface, surface.calcDropDirection(surface_x, surface_y) };
+        };
+
+        self.setTabDragTarget(target, direction);
+    }
+
+    fn tabDragEvent(
+        _: *gtk.EventControllerLegacy,
+        event: *gdk.Event,
+        self: *Self,
+    ) callconv(.c) c_int {
+        if (event.getEventType() == .drop_start) {
+            self.private().tab_drag_dropped = true;
+        }
+
+        // Never handle the event, we only want to know about it.
+        return @intFromBool(false);
+    }
+
+    fn tabDragLeave(
+        _: *gtk.DropControllerMotion,
+        self: *Self,
+    ) callconv(.c) void {
+        self.setTabDragTarget(null, .right);
+    }
+
+    /// Open the tab overview when a split is dragged over the tab overview
+    /// button and held there, so that it can be dropped onto a tab.
+    fn tabOverviewButtonDragEnter(
+        controller: *gtk.DropControllerMotion,
+        _: f64,
+        _: f64,
+        self: *Self,
+    ) callconv(.c) void {
+        const drop = controller.getDrop() orelse return;
+        const formats = drop.getFormats();
+        if (formats.containGtype(gobject.ext.types.uint64) == 0) return;
+
+        const priv = self.private();
+        if (priv.tab_overview_drag_timer) |v| _ = glib.Source.remove(v);
+        priv.tab_overview_drag_timer = glib.timeoutAdd(
+            500,
+            tabOverviewDragTimer,
+            self,
+        );
+    }
+
+    fn tabOverviewButtonDragLeave(
+        _: *gtk.DropControllerMotion,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        if (priv.tab_overview_drag_timer) |v| {
+            _ = glib.Source.remove(v);
+            priv.tab_overview_drag_timer = null;
+        }
+    }
+
+    fn tabOverviewDragTimer(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        const priv = self.private();
+        priv.tab_overview_drag_timer = null;
+        priv.tab_overview.setOpen(@intFromBool(true));
+        return 0;
+    }
+
     fn windowCloseRequest(
         _: *gtk.Window,
         self: *Self,
@@ -1733,6 +2270,27 @@ pub const Window = extern struct {
         if (tab.getSurfaceTree()) |tree| {
             self.connectSurfaceHandlers(tree);
         }
+
+        // Keep our surface handlers in sync as the tree changes. This is
+        // connected here rather than when the tab is created so that tabs
+        // moved between windows notify the window that they are in.
+        _ = SplitTree.signals.changed.connect(
+            tab.getSplitTree(),
+            *Self,
+            tabSplitTreeChanged,
+            self,
+            .{},
+        );
+
+        // A tab that was dragged and dropped onto one of our surfaces is
+        // attached to our tab view by libadwaita. Merge it into the surface.
+        const priv = self.private();
+        if (!priv.tab_drag_dropped) return;
+        const target = priv.tab_drag_target.get() orelse return;
+        defer target.unref();
+        const direction = priv.tab_drag_direction;
+        self.setTabDragTarget(null, direction);
+        self.mergeTabLater(tab, target, direction);
     }
 
     fn tabViewPageDetached(
@@ -1746,6 +2304,16 @@ pub const Window = extern struct {
         const tab = gobject.ext.cast(Tab, child) orelse return;
         _ = gobject.signalHandlersDisconnectMatched(
             tab.as(gobject.Object),
+            .{ .data = true },
+            0,
+            0,
+            null,
+            null,
+            self,
+        );
+
+        _ = gobject.signalHandlersDisconnectMatched(
+            tab.getSplitTree().as(gobject.Object),
             .{ .data = true },
             0,
             0,
@@ -2315,6 +2883,12 @@ pub const Window = extern struct {
             class.bindTemplateCallback("new_tab", &btnNewTab);
             class.bindTemplateCallback("overview_create_tab", &tabOverviewCreateTab);
             class.bindTemplateCallback("overview_notify_open", &tabOverviewOpen);
+            class.bindTemplateCallback("overview_extra_drag_drop", &tabOverviewExtraDragDrop);
+            class.bindTemplateCallback("overview_extra_drag_value", &tabOverviewExtraDragValue);
+            class.bindTemplateCallback("overview_button_drag_enter", &tabOverviewButtonDragEnter);
+            class.bindTemplateCallback("overview_button_drag_leave", &tabOverviewButtonDragLeave);
+            class.bindTemplateCallback("tab_bar_extra_drag_drop", &tabBarExtraDragDrop);
+            class.bindTemplateCallback("tab_bar_extra_drag_value", &tabBarExtraDragValue);
             class.bindTemplateCallback("close_request", &windowCloseRequest);
             class.bindTemplateCallback("close_page", &tabViewClosePage);
             class.bindTemplateCallback("page_attached", &tabViewPageAttached);

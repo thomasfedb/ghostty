@@ -447,6 +447,35 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = i18n.N_("Move the current tab to a new window."),
         }},
 
+        .move_split_to_new_tab => comptime &.{.{
+            .action = .move_split_to_new_tab,
+            .title = i18n.N_("Move Split to New Tab"),
+            .description = i18n.N_("Move the current split into a new tab."),
+        }},
+
+        .merge_tab => comptime &.{
+            .{
+                .action = .{ .merge_tab = .left },
+                .title = i18n.N_("Merge Tab: Left"),
+                .description = i18n.N_("Merge the current tab into the previous tab, to the left of its focused split."),
+            },
+            .{
+                .action = .{ .merge_tab = .right },
+                .title = i18n.N_("Merge Tab: Right"),
+                .description = i18n.N_("Merge the current tab into the previous tab, to the right of its focused split."),
+            },
+            .{
+                .action = .{ .merge_tab = .up },
+                .title = i18n.N_("Merge Tab: Up"),
+                .description = i18n.N_("Merge the current tab into the previous tab, above its focused split."),
+            },
+            .{
+                .action = .{ .merge_tab = .down },
+                .title = i18n.N_("Merge Tab: Down"),
+                .description = i18n.N_("Merge the current tab into the previous tab, below its focused split."),
+            },
+        },
+
         .toggle_tab_overview => comptime &.{.{
             .action = .toggle_tab_overview,
             .title = i18n.N_("Toggle Tab Overview"),
@@ -491,6 +520,34 @@ fn actionCommands(action: Action.Key) []const Command {
                 .action = .{ .new_split = .down },
                 .title = i18n.N_("Split Down"),
                 .description = i18n.N_("Split the terminal down."),
+            },
+        },
+
+        .swap_split => comptime &.{
+            .{
+                .action = .{ .swap_split = .left },
+                .title = i18n.N_("Swap Split: Left"),
+                .description = i18n.N_("Swap the split with the split to the left, if it exists."),
+            },
+            .{
+                .action = .{ .swap_split = .right },
+                .title = i18n.N_("Swap Split: Right"),
+                .description = i18n.N_("Swap the split with the split to the right, if it exists."),
+            },
+            .{
+                .action = .{ .swap_split = .up },
+                .title = i18n.N_("Swap Split: Up"),
+                .description = i18n.N_("Swap the split with the split above, if it exists."),
+            },
+            .{
+                .action = .{ .swap_split = .down },
+                .title = i18n.N_("Swap Split: Down"),
+                .description = i18n.N_("Swap the split with the split below, if it exists."),
+            },
+            .{
+                .action = .{ .swap_split = .sibling },
+                .title = i18n.N_("Swap Split: Sibling"),
+                .description = i18n.N_("Swap the two sides of the split containing the current split."),
             },
         },
 

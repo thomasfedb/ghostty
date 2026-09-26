@@ -154,6 +154,18 @@ pub const SplitTree = extern struct {
         /// tree change states.
         last_focused: WeakRef(Surface) = .empty,
 
+        /// Surface to focus once the tree is rebuilt. This takes priority
+        /// over last_focused, which can change due to focus moving around
+        /// before the rebuild happens (e.g. when switching tabs).
+        pending_focus: WeakRef(Surface) = .empty,
+
+        /// The last surface swapped in a direction, and the surface it was
+        /// swapped with. Swapping that surface back in the other direction
+        /// prefers the same surface, so that a swap can always be undone
+        /// by swapping in the opposite direction.
+        last_swap_surface: WeakRef(Surface) = .empty,
+        last_swap_partner: WeakRef(Surface) = .empty,
+
         /// The source that we use to rebuild the tree. This is also
         /// used to debounce updates.
         rebuild_source: ?c_uint = null,
@@ -239,9 +251,6 @@ pub const SplitTree = extern struct {
                 surface.setParent(core, .split);
             }
         }
-
-        // Bind is-split property for new surface
-        surface.bindIsSplit(self);
 
         // Create our tree
         var single_tree = try Surface.Tree.init(alloc, surface);
@@ -385,21 +394,34 @@ pub const SplitTree = extern struct {
     }
 
     /// Move the source split onto the target split in a given direction.
-    /// The target split must be located within this tree.
+    /// The target split must be located within this tree. If the target
+    /// is null then the active surface of this tree is the target. The
+    /// source split may be located in this tree or in any other tree.
+    ///
+    /// The moved split becomes the focused split of this tree.
     pub fn moveSplit(
         self: *Self,
         source: *Surface,
-        target: *Surface,
+        target_: ?*Surface,
         dir: Surface.Tree.Split.Direction,
     ) Allocator.Error!void {
         const alloc = Application.default().allocator();
         const target_tree = self.getTree() orelse return;
 
         // This really shouldn't fail, but just in case
-        const target_handle = target_tree.locate(target) orelse {
-            log.warn("target is not placed in a split tree", .{});
-            return;
-        };
+        const target_handle = if (target_) |target|
+            target_tree.locate(target) orelse {
+                log.warn("target is not placed in a split tree", .{});
+                return;
+            }
+        else
+            self.getActiveSurfaceHandle() orelse .root;
+
+        // Moving a split onto itself does nothing.
+        switch (target_tree.nodes[target_handle.idx()]) {
+            .leaf => |v| if (v == source) return,
+            .split => {},
+        }
 
         // Try to find the source within the current tree.
         // If it exists, then it's a local move; otherwise the logic gets more
@@ -431,27 +453,176 @@ pub const SplitTree = extern struct {
         } else {
             // :( Cross-tree moves are a bit more complicated.
 
-            // TODO: Find a better way to access the split tree from here
-            const source_tree_widget = ext.getAncestor(
-                SplitTree,
-                source.as(gtk.Widget),
-            ) orelse {
+            const source_tree_widget = fromSurface(source) orelse {
                 log.warn("source is not placed in a split tree", .{});
                 return;
             };
-            const source_tree = source_tree_widget.getTree() orelse return;
 
-            // Remove the source from its own tree
-            const handle = source_tree.locate(source) orelse return;
-            var new_source_tree = try source_tree.remove(alloc, handle);
-            defer new_source_tree.deinit();
-
-            // Finally, set the final tree structures for both tree widgets
-            source_tree_widget.setTree(&new_source_tree);
+            // Finally, set the final tree structures for both tree widgets.
+            // The source must be removed from its own tree first so that
+            // handlers connected for the new tree aren't disconnected by
+            // the source tree changing.
+            try source_tree_widget.removeSurface(source);
             self.setTree(&after_split);
+        }
 
-            // Re-bind vital properties like `is-split`
-            source.bindIsSplit(self);
+        self.focusSurface(source);
+    }
+
+    /// Swap the given surface with another surface in this tree, keeping
+    /// the layout of the tree. The given surface stays focused. Returns
+    /// true if the surfaces were swapped.
+    pub fn swap(
+        self: *Self,
+        surface: *Surface,
+        target: apprt.action.SwapSplit,
+    ) Allocator.Error!bool {
+        const alloc = Application.default().allocator();
+        const priv = self.private();
+        const old_tree = self.getTree() orelse return false;
+        const handle = old_tree.locate(surface) orelse return false;
+
+        // The surface this surface was last swapped with, if any.
+        const partner: ?*Surface = partner: {
+            const last = priv.last_swap_surface.get() orelse break :partner null;
+            defer last.unref();
+            if (last != surface) break :partner null;
+            const partner = priv.last_swap_partner.get() orelse break :partner null;
+            partner.unref();
+            break :partner partner;
+        };
+
+        var swapped_with: ?*Surface = null;
+        var new_tree = switch (target) {
+            .sibling => try old_tree.swapSiblings(alloc, handle) orelse
+                return false,
+
+            inline .up, .left, .down, .right => |tag| new_tree: {
+                const other = try old_tree.nearestInDirection(
+                    alloc,
+                    handle,
+                    @field(Surface.Tree.Spatial.Direction, @tagName(tag)),
+                    if (partner) |v| old_tree.locate(v) else null,
+                ) orelse return false;
+                swapped_with = old_tree.nodes[other.idx()].leaf;
+                break :new_tree try old_tree.swap(alloc, handle, other);
+            },
+        };
+        defer new_tree.deinit();
+
+        priv.last_swap_surface.set(if (swapped_with != null) surface else null);
+        priv.last_swap_partner.set(swapped_with);
+
+        self.setTree(&new_tree);
+        self.focusSurface(surface);
+        return true;
+    }
+
+    /// Insert all the surfaces of the given tree into this tree, placing
+    /// them on the given side of the target surface. If the target is null
+    /// then the active surface of this tree is the target.
+    ///
+    /// The surfaces must first be removed from any other tree they are in.
+    pub fn insertTree(
+        self: *Self,
+        insert: *const Surface.Tree,
+        target_: ?*Surface,
+        dir: Surface.Tree.Split.Direction,
+    ) Allocator.Error!void {
+        const old_tree = self.getTree() orelse {
+            self.setTree(insert);
+            return;
+        };
+
+        const handle = if (target_) |target|
+            old_tree.locate(target) orelse {
+                log.warn("target is not placed in a split tree", .{});
+                return;
+            }
+        else
+            self.getActiveSurfaceHandle() orelse .root;
+
+        var new_tree = try old_tree.split(
+            Application.default().allocator(),
+            handle,
+            dir,
+            0.5,
+            insert,
+        );
+        defer new_tree.deinit();
+        self.setTree(&new_tree);
+    }
+
+    /// Remove the given surface from this tree without closing it, e.g.
+    /// so that it can be placed into another tree. Focus moves to a
+    /// neighboring surface in the same way as when a split is closed.
+    pub fn removeSurface(self: *Self, surface: *Surface) Allocator.Error!void {
+        const tree = self.getTree() orelse return;
+        const handle = tree.locate(surface) orelse return;
+        try self.removeHandle(handle);
+    }
+
+    fn removeHandle(
+        self: *Self,
+        handle: Surface.Tree.Node.Handle,
+    ) Allocator.Error!void {
+        // Figure out our next focus target. The next focus target is
+        // always the "previous" surface unless we're the leftmost then
+        // its the next.
+        const old_tree = self.getTree() orelse return;
+        const next_focus: ?*Surface = next_focus: {
+            const alloc = Application.default().allocator();
+            const next_handle: Surface.Tree.Node.Handle =
+                (old_tree.goto(alloc, handle, .previous) catch null) orelse
+                (old_tree.goto(alloc, handle, .next) catch null) orelse
+                break :next_focus null;
+            if (next_handle == handle) break :next_focus null;
+
+            // Note: we don't need to ref this or anything because its
+            // guaranteed to remain in the new tree since its not part
+            // of the handle we're removing.
+            break :next_focus old_tree.nodes[next_handle.idx()].leaf;
+        };
+
+        // Remove it from the tree.
+        var new_tree = try old_tree.remove(
+            Application.default().allocator(),
+            handle,
+        );
+        defer new_tree.deinit();
+        self.setTree(&new_tree);
+
+        // Grab focus. We have to set this on the "last focused" because our
+        // focus will be set when the tree is redrawn.
+        if (next_focus) |v| self.private().last_focused.set(v);
+    }
+
+    /// Returns the split tree that the given surface is currently in.
+    pub fn fromSurface(surface: *Surface) ?*Self {
+        // TODO: Find a better way to access the split tree from here
+        const split_tree = ext.getAncestor(
+            Self,
+            surface.as(gtk.Widget),
+        ) orelse return null;
+
+        // Our widget hierarchy is rebuilt on an idle callback after the
+        // tree changes, so the surface may be a descendant of a tree that
+        // it has already been removed from.
+        const tree = split_tree.getTree() orelse return null;
+        if (tree.locate(surface) == null) return null;
+
+        return split_tree;
+    }
+
+    /// Focus the given surface, which must be in this tree. If the tree
+    /// is waiting to be rebuilt then the surface is focused once it is.
+    pub fn focusSurface(self: *Self, surface: *Surface) void {
+        const priv = self.private();
+        priv.last_focused.set(surface);
+        if (priv.rebuild_source == null) {
+            surface.grabFocus();
+        } else {
+            priv.pending_focus.set(surface);
         }
     }
 
@@ -477,6 +648,11 @@ pub const SplitTree = extern struct {
         var it = tree.iterator();
         while (it.next()) |entry| {
             const surface = entry.view;
+
+            // Surfaces can be moved between trees, so always make sure
+            // properties like `is-split` are bound to the tree they're in.
+            surface.bindIsSplit(self);
+
             _ = Surface.signals.@"close-request".connect(
                 surface,
                 *Self,
@@ -648,6 +824,9 @@ pub const SplitTree = extern struct {
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
         priv.last_focused.deinit();
+        priv.pending_focus.deinit();
+        priv.last_swap_surface.deinit();
+        priv.last_swap_partner.deinit();
         if (priv.rebuild_source) |v| {
             if (glib.Source.remove(v) == 0) {
                 log.warn("unable to remove rebuild source", .{});
@@ -806,38 +985,9 @@ pub const SplitTree = extern struct {
         const handle = priv.pending_close orelse return;
         priv.pending_close = null;
 
-        // Figure out our next focus target. The next focus target is
-        // always the "previous" surface unless we're the leftmost then
-        // its the next.
-        const old_tree = self.getTree() orelse return;
-        const next_focus: ?*Surface = next_focus: {
-            const alloc = Application.default().allocator();
-            const next_handle: Surface.Tree.Node.Handle =
-                (old_tree.goto(alloc, handle, .previous) catch null) orelse
-                (old_tree.goto(alloc, handle, .next) catch null) orelse
-                break :next_focus null;
-            if (next_handle == handle) break :next_focus null;
-
-            // Note: we don't need to ref this or anything because its
-            // guaranteed to remain in the new tree since its not part
-            // of the handle we're removing.
-            break :next_focus old_tree.nodes[next_handle.idx()].leaf;
-        };
-
-        // Remove it from the tree.
-        var new_tree = old_tree.remove(
-            Application.default().allocator(),
-            handle,
-        ) catch |err| {
+        self.removeHandle(handle) catch |err| {
             log.warn("unable to remove surface from tree: {}", .{err});
-            return;
         };
-        defer new_tree.deinit();
-        self.setTree(&new_tree);
-
-        // Grab focus. We have to set this on the "last focused" because our
-        // focus will be set when the tree is redrawn.
-        if (next_focus) |v| priv.last_focused.set(v);
     }
 
     fn propSurfaceFocused(
@@ -937,6 +1087,14 @@ pub const SplitTree = extern struct {
             );
             defer built.deinit();
             priv.tree_bin.setChild(built.widget);
+        }
+
+        // If we were asked to focus a surface once rebuilt, it is now
+        // our last-focused surface.
+        if (priv.pending_focus.get()) |v| {
+            defer v.unref();
+            priv.pending_focus.set(null);
+            priv.last_focused.set(v);
         }
 
         // Replacing our tree widget hierarchy can reset focus state.

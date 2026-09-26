@@ -36,6 +36,7 @@ const Window = @import("window.zig").Window;
 const InspectorWindow = @import("inspector_window.zig").InspectorWindow;
 const SplitTree = @import("split_tree.zig").SplitTree;
 const RenderSurface = @import("render_surface.zig").RenderSurface;
+const RootWindowDrop = @import("root_window_drop.zig").RootWindowDrop;
 const i18n = @import("../../../os/i18n.zig");
 const global = @import("../../../global.zig");
 const gtk_version = @import("../gtk_version.zig");
@@ -702,6 +703,10 @@ pub const Surface = extern struct {
         // Key state tracking for key sequences and tables
         key_sequence: std.ArrayListUnmanaged([:0]const u8) = .empty,
         key_tables: std.ArrayListUnmanaged([:0]const u8) = .empty,
+
+        /// Records whether the split currently being dragged by its drag
+        /// handle was dropped outside of any window.
+        drag_root_drop: ?*RootWindowDrop = null,
 
         // Template binds
         child_exited_overlay: *ChildExited,
@@ -1889,6 +1894,11 @@ pub const Surface = extern struct {
         if (priv.config) |v| {
             v.unref();
             priv.config = null;
+        }
+
+        if (priv.drag_root_drop) |v| {
+            v.unref();
+            priv.drag_root_drop = null;
         }
 
         if (priv.is_split_binding) |binding| {
@@ -3653,7 +3663,60 @@ pub const Surface = extern struct {
         _ = x;
         _ = y;
         var val = gobject.ext.Value.newFrom(self.core().?.id);
-        return gdk.ContentProvider.newForValue(&val);
+        const value_provider = gdk.ContentProvider.newForValue(&val);
+
+        // Track whether the split is dropped outside of any window, which
+        // moves it to a new window. See surfaceDragCancel and surfaceDragEnd.
+        const priv = self.private();
+        if (priv.drag_root_drop) |v| v.unref();
+        const root_drop = RootWindowDrop.new();
+        priv.drag_root_drop = root_drop;
+
+        // On Wayland, dropping onto the desktop cancels the drag the same as
+        // any other failed drop, so the compositor must be told that we accept
+        // such drops. X11 drags report drops outside of any window as having no
+        // target, and GDK doesn't support accepting root window drops.
+        switch (Application.default().winproto().*) {
+            .wayland => {},
+            .x11, .none => return value_provider,
+        }
+
+        var providers = [_]*gdk.ContentProvider{
+            value_provider,
+            root_drop.ref().as(gdk.ContentProvider),
+        };
+        return gdk.ContentProvider.newUnion(&providers, providers.len);
+    }
+
+    fn surfaceDragCancel(
+        _: *gtk.DragSource,
+        _: *gdk.Drag,
+        reason: gdk.DragCancelReason,
+        self: *Self,
+    ) callconv(.c) c_int {
+        // Some platforms don't support dropping onto the desktop and
+        // instead cancel drags that are dropped outside of any window.
+        // Drops anywhere within one of our windows are caught by the
+        // window, so they don't get here.
+        if (reason != .no_target) return @intFromBool(false);
+        const root_drop = self.private().drag_root_drop orelse return @intFromBool(false);
+        root_drop.setDropped();
+        return @intFromBool(true);
+    }
+
+    fn surfaceDragEnd(
+        _: *gtk.DragSource,
+        _: *gdk.Drag,
+        _: c_int,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const root_drop = priv.drag_root_drop orelse return;
+        priv.drag_root_drop = null;
+        defer root_drop.unref();
+
+        // A split dropped outside of any window is moved to a new window.
+        if (root_drop.getDropped()) _ = Window.moveSplitToNewWindow(self);
     }
 
     fn surfaceDragBegin(
@@ -3708,9 +3771,14 @@ pub const Surface = extern struct {
         x: f64,
         y: f64,
         self: *Self,
-    ) callconv(.c) void {
+    ) callconv(.c) c_int {
+        // Clean up overlay state
+        defer self.setDropOverlayDirection(null);
+
+        const dir = self.calcDropDirection(x, y);
+
         const dropped_id = v.getUint64();
-        const dropped = self.core().?.app.findSurfaceByID(dropped_id) orelse return;
+        const dropped = self.core().?.app.findSurfaceByID(dropped_id) orelse return 0;
         const from = dropped.rt_surface.gobj();
 
         const st = ext.getAncestor(
@@ -3718,17 +3786,13 @@ pub const Surface = extern struct {
             self.as(gtk.Widget),
         ) orelse {
             log.warn("surface is not placed in a split tree", .{});
-            return;
+            return 0;
         };
-
-        const dir = self.calcDropDirection(x, y);
 
         // The only error that could happen here is an OOM,
         // and in that case we're already milliseconds away from crashing, so...
-        st.moveSplit(from, self, dir) catch return;
-
-        // Clean up overlay state
-        self.setDropOverlayDirection(null);
+        st.moveSplit(from, self, dir) catch return 0;
+        return 1;
     }
 
     fn surfaceDropLeave(
@@ -3768,7 +3832,9 @@ pub const Surface = extern struct {
         if (core_surface.id == surface_id) tgt.reject();
     }
 
-    fn setDropOverlayDirection(self: *Self, dir: ?Tree.Split.Direction) void {
+    /// Show which side of this surface something being dragged would be
+    /// dropped on, or hide the overlay if null.
+    pub fn setDropOverlayDirection(self: *Self, dir: ?Tree.Split.Direction) void {
         const priv = self.private();
         inline for (&.{ "drop-top", "drop-left", "drop-right", "drop-bottom" }) |c| {
             priv.drop_overlay.removeCssClass(c);
@@ -3782,7 +3848,9 @@ pub const Surface = extern struct {
         });
     }
 
-    fn calcDropDirection(self: *Self, x: f64, y: f64) Tree.Split.Direction {
+    /// Returns the side of this surface that something dropped at the given
+    /// coordinates (relative to this surface) should be placed on.
+    pub fn calcDropDirection(self: *Self, x: f64, y: f64) Tree.Split.Direction {
         const width: f64 = @floatFromInt(self.as(gtk.Widget).getWidth());
         const height: f64 = @floatFromInt(self.as(gtk.Widget).getHeight());
 
@@ -3884,6 +3952,8 @@ pub const Surface = extern struct {
             class.bindTemplateCallback("should_drag_handle_be_shown", &closureShouldDragHandleBeShown);
             class.bindTemplateCallback("surface_drag_prepare", &surfaceDragPrepare);
             class.bindTemplateCallback("surface_drag_begin", &surfaceDragBegin);
+            class.bindTemplateCallback("surface_drag_cancel", &surfaceDragCancel);
+            class.bindTemplateCallback("surface_drag_end", &surfaceDragEnd);
             class.bindTemplateCallback("surface_drop", &surfaceDrop);
             class.bindTemplateCallback("surface_drop_leave", &surfaceDropLeave);
             class.bindTemplateCallback("surface_drop_motion", &surfaceDropMotion);

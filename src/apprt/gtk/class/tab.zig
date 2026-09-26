@@ -195,20 +195,8 @@ pub const Tab = extern struct {
 
         pub const none: @This() = .{};
     }) *Self {
-        const tab = gobject.ext.newInstance(Tab, .{});
-
+        const tab = create(config);
         const priv: *Private = tab.private();
-
-        if (config) |c| priv.config = c.ref();
-
-        // If our configuration is null then we get the configuration
-        // from the application.
-        if (priv.config == null) {
-            const app = Application.default();
-            priv.config = app.getConfig();
-        }
-
-        tab.as(gobject.Object).notifyByPspec(properties.config.impl.param_spec);
 
         // Create our initial surface in the split tree.
         priv.split_tree.newSplit(.right, null, .{
@@ -224,6 +212,41 @@ pub const Tab = extern struct {
                 @panic("oom");
             },
         };
+
+        return tab;
+    }
+
+    /// Create a new tab containing the surfaces of an existing tree,
+    /// rather than creating a new surface. The surfaces must first be
+    /// removed from any other tree they are in. The given surface, if
+    /// any, will be focused when the tab is shown.
+    pub fn newForTree(
+        config: ?*Config,
+        tree: *const Surface.Tree,
+        focus: ?*Surface,
+    ) *Self {
+        const tab = create(config);
+        const split_tree = tab.private().split_tree;
+        split_tree.setTree(tree);
+        if (focus) |v| split_tree.focusSurface(v);
+        return tab;
+    }
+
+    fn create(config: ?*Config) *Self {
+        const tab = gobject.ext.newInstance(Tab, .{});
+
+        const priv: *Private = tab.private();
+
+        if (config) |c| priv.config = c.ref();
+
+        // If our configuration is null then we get the configuration
+        // from the application.
+        if (priv.config == null) {
+            const app = Application.default();
+            priv.config = app.getConfig();
+        }
+
+        tab.as(gobject.Object).notifyByPspec(properties.config.impl.param_spec);
 
         return tab;
     }
