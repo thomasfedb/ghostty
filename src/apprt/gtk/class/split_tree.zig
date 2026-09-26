@@ -303,13 +303,15 @@ pub const SplitTree = extern struct {
         const height_f64: f64 = @floatFromInt(height);
         const amount_f64: f64 = @floatFromInt(amount);
 
-        // Get our ratio and use positive/neg for directions.
-        const ratio: f64 = switch (direction) {
+        // Get our ratio and use positive/neg for directions. The amount can
+        // be larger than the split, which can only resize it as far as the
+        // edge, so the ratio is clamped.
+        const ratio: f64 = std.math.clamp(switch (direction) {
             .right => amount_f64 / width_f64,
             .left => -(amount_f64 / width_f64),
             .down => amount_f64 / height_f64,
             .up => -(amount_f64 / height_f64),
-        };
+        }, -1, 1);
 
         const layout: Surface.Tree.Split.Layout = switch (direction) {
             .left, .right => .horizontal,
@@ -1219,16 +1221,14 @@ const SplitTreeSplit = extern struct {
             .vertical => .vertical,
         });
 
-        // Request min width/height 1 for surfaces to prevent them from
-        // becoming temporarily invisible in nested layouts. Otherwise
-        // gtk.Paned might mark a surface as not visible and unmap it
-        // for a single frame. See the comments below in propMaxPosition.
-        if (gobject.ext.isA(start_child, SurfaceScrolledWindow)) {
-            start_child.setSizeRequest(1, 1);
-        }
-        if (gobject.ext.isA(end_child, SurfaceScrolledWindow)) {
-            end_child.setSizeRequest(1, 1);
-        }
+        // Surfaces request a minimum size of at least one cell (see
+        // SurfaceScrolledWindow.syncSplitMinSize), and our gtk.Paned doesn't
+        // shrink its children below their minimum size. This ensures a split
+        // is never resized so small that none of its terminal is visible.
+        // It also prevents surfaces from becoming temporarily invisible in
+        // nested layouts. Otherwise gtk.Paned might mark a surface as not
+        // visible and unmap it for a single frame. See the comments below in
+        // propMaxPosition.
 
         // Signals and so on are setup in the template.
 
@@ -1274,9 +1274,9 @@ const SplitTreeSplit = extern struct {
             break :max gobject.ext.Value.get(&val, c_int);
         };
 
-        // We don't actually use min, but we don't expect this to ever
-        // be non-zero, so let's add an assert to ensure that.
-        assert(min == 0);
+        // We don't use min. It's non-zero when the start child has a minimum
+        // size, but gtk.Paned keeps the position between min and max itself.
+        _ = min;
 
         // If our max is zero then we can't do any math. I don't know
         // if this is possible but I suspect it can be if you make a nested
