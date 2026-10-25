@@ -281,6 +281,17 @@ _version_ is used—this adds unnecessary changes to the diff.
 You can remove the `X-Generator` field by simply deleting that line from the
 file with a plain text editor.
 
+### Line wrapping
+
+Translation files must be wrapped the way gettext's own tools wrap them,
+otherwise the next `zig build update-translations` rewraps them and adds
+unnecessary changes to someone else's diff. CI checks this. If you edited a
+file by hand or with an editor that wraps lines differently, rewrap it with:
+
+```
+msgcat -o po/<locale>.po po/<locale>.po
+```
+
 ### Updating metadata (revision date)
 
 It is very easy to overlook the `PO-Revision-Date` field in the metadata at the
